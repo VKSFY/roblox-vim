@@ -1,3 +1,6 @@
+-- Discord: 6lyra
+-- Roblox: OP_vaks
+
 --!strict
 -- Modal vim editor. Separate from the nano overlay -- only shares the VFS
 -- load/save path via the shell command.
