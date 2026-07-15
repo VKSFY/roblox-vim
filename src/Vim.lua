@@ -1,13 +1,13 @@
 --!strict
--- Modal vim. Separate module from nano -- only shares VFS load/save via the
--- shell command.
+-- Modal vim editor. Separate from the nano overlay -- only shares the VFS
+-- load/save path via the shell command.
 --
--- Roblox gives us KeyCodes, not characters, so reconstructing shift-dependent
--- keys ($, :, G, O) from KeyCode alone is a pain. Workaround: a focused,
--- invisible TextBox just streams characters -- cleared every change, characters
--- fed straight to whatever mode is active. Correct case/symbols for free.
--- UserInputService only handles the keys that produce no character: Esc,
--- Backspace, Enter, Ctrl+R, arrows.
+-- Roblox gives scripts KeyCodes, not characters, so rebuilding shift-dependent
+-- keys ($, :, G, O) from KeyCode is painful. Instead we keep a focused,
+-- invisible TextBox around purely to catch characters -- clear it every change,
+-- feed whatever came in to the active mode. Gets us correct case/symbols for
+-- free. UserInputService only has to deal with keys that produce no character:
+-- Esc, Backspace, Enter, Ctrl+R, arrows.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -19,10 +19,10 @@ local UI = require(script.Parent.UI)
 
 local HUGE = Vector2.new(math.huge, math.huge)
 
--- Real rendered pixel width of a text run. Can't just do col * CHAR_WIDTH --
--- tabs are 1 column but render as 4 cells, so that math put the caret 3 cells
--- left of where the text actually was on any indented line. This asks the
--- layout engine directly instead.
+-- Actual rendered width of a text run, not column count * CHAR_WIDTH. Tabs
+-- broke that assumption (1 column, 4 cells wide) and left the caret sitting
+-- inside the previous word on indented lines. This just asks the layout
+-- engine what the label would actually draw.
 local function textWidth(text: string): number
 	if text == "" then
 		return 0
@@ -36,11 +36,10 @@ Vim.__index = Vim
 local MAX_UNDO = 200
 local STATUS_HEIGHT = UI.LINE_HEIGHT + 4
 
--- Roblox doesn't auto-repeat InputBegan for held keys, so Backspace/arrows
--- (no character event at all) never repeated on their own -- nano was fine
--- since it's a real TextBox and gets the OS's repeat for free. This clock
--- drives repeat for everything vim owns, including deduping the OS's own
--- repeated characters so a held key doesn't double-fire.
+-- Roblox doesn't auto-repeat InputBegan, so Backspace/arrows (no char event)
+-- never repeated on their own -- had to build that here. Character keys DO
+-- get OS repeat through the capture box already, so this clock also dedupes
+-- those against its own repeats instead of letting both run at once.
 local REPEAT_DELAY = 0.4
 local REPEAT_INTERVAL = 0.03
 
@@ -93,7 +92,6 @@ function Vim:_clamp()
 	self.cursorLine = math.clamp(self.cursorLine, 1, #self.lines)
 
 	local length = #self.lines[self.cursorLine]
-	-- insert can sit one past the last char; normal can't
 	local maxCol = if self.mode == "insert" then length + 1 else math.max(length, 1)
 	self.cursorCol = math.clamp(self.cursorCol, 1, maxCol)
 end
@@ -107,7 +105,6 @@ function Vim:_snapshot()
 	if #self.undoStack > MAX_UNDO then
 		table.remove(self.undoStack, 1)
 	end
-	-- new change kills the redo branch
 	self.redoStack = {}
 end
 
@@ -153,7 +150,6 @@ function Vim:_wordForward()
 	local line = self.lines[self.cursorLine]
 	local col = self.cursorCol
 
-	-- off the current word, then past any spaces
 	while col <= #line and isWordChar(string.sub(line, col, col)) do
 		col += 1
 	end
@@ -218,7 +214,7 @@ function Vim:_deleteLines(from: number, to: number)
 	end
 end
 
--- charwise span between two positions, inclusive both ends (`v`)
+-- inclusive span between anchor and cursor, normalized so start <= end
 function Vim:_span(): (number, number, number, number)
 	local aLine, aCol = self.anchorLine, self.anchorCol
 	local bLine, bCol = self.cursorLine, self.cursorCol
@@ -274,7 +270,6 @@ function Vim:_paste()
 	self:_snapshot()
 
 	if register.linewise then
-		-- linewise p goes after the current line
 		for offset, line in register.lines do
 			table.insert(self.lines, self.cursorLine + offset, line)
 		end
@@ -313,10 +308,10 @@ function Vim:_matches(): { { line: number, col: number } }
 		return found
 	end
 
+	-- plain substring only, no pattern/regex support
 	for index, line in self.lines do
 		local start = 1
 		while true do
-			-- plain substring, no regex
 			local at = string.find(line, self.lastSearch, start, true)
 			if not at then
 				break
@@ -369,7 +364,6 @@ end
 
 function Vim:_leaveInsert()
 	self.mode = "normal"
-	-- step back off the past-end position
 	self.cursorCol = math.max(self.cursorCol - 1, 1)
 	self:_clamp()
 end
@@ -378,7 +372,6 @@ function Vim:_normalKey(char: string)
 	local pending = self.pending
 	self.pending = nil
 
-	-- dd / yy / gg
 	if pending == "d" then
 		if char == "d" then
 			self:_snapshot()
@@ -549,7 +542,7 @@ function Vim:_runCommand()
 			self:_quit()
 		end
 	elseif command == "" then
-		-- bare ":"
+		-- nothing typed after ':', ignore
 	else
 		self:_setStatus("E492: Not an editor command: " .. command, true)
 	end
@@ -606,7 +599,8 @@ function Vim:_ctrlDown(): boolean
 end
 
 function Vim:_feed(char: string)
-	-- clear stale status on next keystroke, same as real vim
+	-- real vim clears the status line on the next keystroke -- otherwise
+	-- something like "2 lines deleted" just sits there forever
 	self.statusMessage = ""
 	self.statusIsError = false
 
@@ -639,9 +633,9 @@ function Vim:_feed(char: string)
 	end
 end
 
--- holding a key re-runs `act` every REPEAT_INTERVAL until released. `char`
--- names the character a held key produces, so we can tell our own repeat
--- apart from the OS's.
+-- keeps re-firing `act` every REPEAT_INTERVAL while the key is held.
+-- `char` is only set for character keys -- lets us match a held key's
+-- own repeat against whatever the OS also sends so we don't double up
 function Vim:_arm(key: Enum.KeyCode, act: () -> (), char: string?)
 	self.held = { key = key, act = act, char = char, due = os.clock() + REPEAT_DELAY }
 end
@@ -666,8 +660,6 @@ function Vim:_backspace()
 	end
 end
 
--- arrows = hjkl, and insert mode gets them too since that's the only way to
--- move the cursor while typing
 function Vim:_motion(motion: string)
 	if self.mode == "insert" then
 		if motion == "h" then
@@ -687,8 +679,6 @@ function Vim:_motion(motion: string)
 	end
 end
 
--- Esc/Backspace/Ctrl+R/arrows produce no character, so these come through
--- UserInputService instead of the TextBox stream
 function Vim:_onKey(input: InputObject)
 	if input.UserInputType ~= Enum.UserInputType.Keyboard or not self.root then
 		return
@@ -699,15 +689,16 @@ function Vim:_onKey(input: InputObject)
 
 	self.lastKey = key
 
-	-- InputBegan never fires for auto-repeat, so a second InputBegan for a key
-	-- we're already repeating has to be a real second press -- end the old
-	-- repeat instead of mistaking this one for the OS's
+	-- InputBegan doesn't fire again for OS auto-repeat, so if we're already
+	-- repeating this key, a new InputBegan means it was actually released
+	-- and pressed again -- reset instead of assuming it's the same hold
 	if self.held and self.held.key == key then
 		self.held = nil
 	end
 
-	-- Escape is permanently bound to the Roblox menu, so it pops that too.
-	-- Ctrl+[ and Ctrl+C are the real vim Esc aliases and actually work here.
+	-- Escape is hard-bound to the Roblox menu at the engine level, nothing
+	-- we can do about that from script -- Ctrl+[ / Ctrl+C are the working
+	-- substitutes and match real vim's own Esc aliases anyway
 	local isEscape = key == Enum.KeyCode.Escape
 		or (ctrl and (key == Enum.KeyCode.LeftBracket or key == Enum.KeyCode.C))
 
@@ -830,7 +821,6 @@ function Vim:_render()
 			label.Text = self.lines[index]
 			label.TextColor3 = hex(Ansi.Colors.fg)
 		else
-			-- past EOF: blue tildes, like real vim
 			label.Text = "~"
 			label.TextColor3 = hex(Ansi.Colors.blue)
 		end
@@ -842,8 +832,8 @@ function Vim:_render()
 
 	self.buffer.CanvasSize = UDim2.new(0, 0, 0, total * UI.LINE_HEIGHT)
 
-	-- selection highlight -- RichText has no background color, so this is
-	-- frames drawn behind the text
+	-- RichText has no background colour option, so selection highlight is
+	-- just plain Frames drawn underneath the text labels
 	for _, frame in self.selectionFrames do
 		frame.Visible = false
 	end
@@ -874,7 +864,7 @@ function Vim:_render()
 				to = if index == endLine then endCol else math.max(length, 1)
 			end
 
-			-- pixel spans, not column spans -- same tab issue as the caret
+			-- same tab-width issue as the caret -- pixel spans, not columns
 			local lineText = self.lines[index]
 			local x0 = textWidth(string.sub(lineText, 1, from - 1))
 			local x1 = textWidth(string.sub(lineText, 1, to))
@@ -885,15 +875,10 @@ function Vim:_render()
 		end
 	end
 
-	-- cursor: block in normal/visual, thin bar in insert, like a real
-	-- terminal. X comes from the measured width of everything to its left so
-	-- tabs push it exactly as far as they push the text.
 	local insert = self.mode == "insert"
 	local lineText = self.lines[self.cursorLine]
 	local caretX = textWidth(string.sub(lineText, 1, self.cursorCol - 1))
 
-	-- normal-mode block sits on a character, so its width matches that
-	-- character's real rendered width (wide over a tab, narrow otherwise)
 	local onChar = string.sub(lineText, self.cursorCol, self.cursorCol)
 	local blockWidth = if onChar == "" then UI.CHAR_WIDTH else textWidth(onChar)
 
@@ -906,7 +891,6 @@ function Vim:_render()
 		(self.cursorLine - 1) * UI.LINE_HEIGHT + (UI.LINE_HEIGHT - UI.TEXT_SIZE) / 2
 	)
 
-	-- keep the cursor line on screen
 	local cursorY = (self.cursorLine - 1) * UI.LINE_HEIGHT
 	local top = self.buffer.CanvasPosition.Y
 	local viewHeight = self.buffer.AbsoluteWindowSize.Y
@@ -922,13 +906,11 @@ function Vim:_render()
 	self.statusLabel.BackgroundColor3 = hex(Ansi.Colors.red)
 	self.statusLabel.BackgroundTransparency = if self.statusIsError then 0 else 1
 
-	-- vim's ruler
 	self.rulerLabel.Text = string.format("%d,%d", self.cursorLine, self.cursorCol)
 end
 
 --[[ Entry point ]]
 
--- blocks until the user quits
 function Vim:open(filename: string, content: string, save: (string) -> (boolean, string))
 	local thread = coroutine.running()
 
@@ -1019,8 +1001,8 @@ function Vim:open(filename: string, content: string, save: (string) -> (boolean,
 	ruler.Parent = root
 	self.rulerLabel = ruler
 
-	-- character-stream capture box, invisible, never holds text for more than
-	-- an instant
+	-- invisible capture box, just here to grab character input -- never
+	-- actually holds text for more than a frame
 	local box = Instance.new("TextBox")
 	box.Name = "Capture"
 	box.Size = UDim2.fromScale(1, 1)
@@ -1049,15 +1031,16 @@ function Vim:open(filename: string, content: string, save: (string) -> (boolean,
 			box.Text = ""
 			self.suppress = false
 
-			-- ctrl-chords are commands, not text -- don't let Ctrl+R type an "r"
+			-- ctrl combos are commands, not text -- otherwise Ctrl+R would
+			-- also type an "r"
 			if self:_ctrlDown() then
 				return
 			end
 
-			-- the OS keeps sending characters while a key is held. once we're
-			-- repeating it on our own clock, those are duplicates -- drop only
-			-- the character this specific held key produces, anything else
-			-- pressed mid-hold still goes through
+			-- the OS keeps sending characters on its own while a key is held.
+			-- once we're repeating that key ourselves, those are duplicates --
+			-- only drop the character THIS key produces though, anything else
+			-- typed mid-hold should still go through normally
 			local held = self.held
 			if
 				held
@@ -1073,9 +1056,6 @@ function Vim:open(filename: string, content: string, save: (string) -> (boolean,
 			end
 			self:_render()
 
-			-- hold h, it keeps moving; hold x, it keeps deleting. using the
-			-- character this key just produced means shifted keys repeat
-			-- correctly without reconstructing them from the KeyCode
 			local key = self.lastKey
 			if #typed == 1 and key and UserInputService:IsKeyDown(key) then
 				self:_arm(key, function()
@@ -1115,7 +1095,6 @@ function Vim:open(filename: string, content: string, save: (string) -> (boolean,
 		end)
 	)
 
-	-- repeat clock
 	table.insert(
 		self.conns,
 		RunService.Heartbeat:Connect(function()
@@ -1124,8 +1103,6 @@ function Vim:open(filename: string, content: string, save: (string) -> (boolean,
 				return
 			end
 
-			-- alt-tab eats InputEnded, so a key that's no longer down can't
-			-- keep repeating forever
 			if not UserInputService:IsKeyDown(held.key) then
 				self.held = nil
 				return
